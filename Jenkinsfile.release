@@ -1,0 +1,173 @@
+@Library('Utils') _
+
+/* The path, relative to the root of the repo (where this Jenkinsfile is),
+ * where the file that contains the version tag (e.g. 1.0) resides.
+ */
+final APP_VERSION_FILE = 'app/VERSION'
+
+pipeline {
+    agent any
+    stages {
+        stage('Confirm Application Version File') {
+            steps {
+                script {
+                    if (! fileExists(APP_VERSION_FILE)) {
+                        error("Application version tracking file ${APP_VERSION_FILE} does not exist!")
+                        return
+                    }
+                    env.RELEASE_VERSION = readFile(APP_VERSION_FILE).trim()
+                }
+            }
+        }
+        /** Create Credentials
+         *
+         * Create a Jenkins Credential from OpenShift Secret
+         * In this case the OpenShift service tokens for the
+         * other environments.
+         */
+        stage('Create Credentials') {
+            steps {
+                checkout scm
+                syncOpenShiftSecret "${params.PROD_SECRET_NAME}"
+                syncOpenShiftSecret "${params.REGISTRY_SECRET_NAME}"
+            }
+        }
+        /** Production - Tag
+         *
+         * Prompt the user for the production image tag.
+         * Check to make sure it exists and if so tag with the
+         * release version and latest.
+         */
+        stage('Production - Tag') {
+            environment {
+                REGISTRY = credentials("${params.REGISTRY_SECRET_NAME}")
+            }
+            steps {
+                script {
+                    /** Set the Production Tag via a build parameter
+                     *
+                     * The RELEASE_VERSION_TAG optional parameter allows to pre-set
+                     * which image tag to promote to production. If unset, the user
+                     * will be prompted.
+                     */
+                    def releaseVersionTag
+                    if (params.containsKey('RELEASE_VERSION_TAG')) {
+                        releaseVersionTag = params.RELEASE_VERSION_TAG
+                    } else {
+                        timeout(2) {
+                            releaseVersionTag = input(
+                                message: "Enter build to release as version ${env.RELEASE_VERSION}",
+                                parameters: [ string(defaultValue: '',
+                                                     description: 'Build version image tag, e.g. 1.3-8',
+                                                     name: 'buildVersion')
+                                ])
+                        }
+                    }
+                    echo "Releasing build ${releaseVersionTag} as ${env.RELEASE_VERSION}"
+
+                    /* Connect to the registry cluster and project
+                     * Make sure the image tag exists if not abort the job
+                     */
+                    openshift.withCluster("${params.OPENSHIFT_REGISTRY_URI}", env.REGISTRY_PSW) {
+                        openshift.withProject("${params.REGISTRY_PROJECT}") {
+                            def istagSelector = openshift.selector("istag", "${params.IMAGE_STREAM_NAME}:${releaseVersionTag}")
+                            if (!istagSelector.exists()) {
+                                echo "Imagestream tag ${releaseVersionTag} does not exist in registry"
+                                currentBuild.result = 'ABORTED'
+                            }
+                        }
+                    }
+
+                    /* Connect to the registry cluster and project.
+                     * Tag the image with latest and the release version
+                     */
+                    openshift.withCluster("${params.OPENSHIFT_REGISTRY_URI}", env.REGISTRY_PSW) {
+                        openshift.withProject("${params.REGISTRY_PROJECT}") {
+                            openshift.tag("${openshift.project()}/${params.IMAGE_STREAM_NAME}:${releaseVersionTag}",
+                                    "${openshift.project()}/${params.IMAGE_STREAM_NAME}:${env.RELEASE_VERSION}")
+                            openshift.tag("${openshift.project()}/${params.IMAGE_STREAM_NAME}:${releaseVersionTag}",
+                                    "${openshift.project()}/${params.IMAGE_STREAM_NAME}:latest")
+                        }
+                    }
+                }
+            }
+        }
+        /** Production - OpenShift Template
+         *
+         * This stage applies the template that is available in the project repository.
+         * Processes the template using parameters defined in the Jenkins Job
+         * And finally applies the objects returned from processing
+         */
+        stage('Production - OpenShift Template') {
+            environment {
+                PRODUCTION = credentials("${params.PROD_SECRET_NAME}")
+            }
+            steps {
+                script {
+                    openshift.withCluster("${params.PROD_URI}", env.PRODUCTION_PSW) {
+                        openshift.withProject("${params.PROD_PROJECT}") {
+                            // Apply the template object from JSON file
+                            openshift.apply(readFile("${params.APP_TEMPLATE_PATH}"))
+
+                            createdObjects = openshift.apply(
+                                openshift.process("${params.IMAGE_STREAM_NAME}",
+                                    "-l app=${params.IMAGE_STREAM_NAME}",
+                                    "-p",
+                                    "TAG=${env.RELEASE_VERSION}",
+                                    "IMAGESTREAM_TAG=${env.RELEASE_VERSION}",
+                                    "REGISTRY=${params.REGISTRY_URI}",
+                                    "REGISTRY_PROJECT=${params.REGISTRY_PROJECT}"))
+
+                            // The production environment does not need buildconfigs
+                            createdObjects.narrow('bc').delete()
+                        }
+                    }
+                }
+            }
+        }
+        /** Production - Rollout
+         *
+         * This stage rolls out the OpenShift DeploymentConfig defining the application.
+         * It will wait until the rollout completes or fails.
+         */
+        stage('Production - Rollout') {
+            environment {
+                PRODUCTION = credentials("${params.PROD_SECRET_NAME}")
+            }
+            steps {
+                script {
+                    openshift.withCluster("${params.PROD_URI}", env.PRODUCTION_PSW) {
+                        openshift.withProject("${params.PROD_PROJECT}") {
+                            deploymentConfigs = createdObjects.narrow('dc')
+                            nodedc = deploymentConfigs.selector("dc", "${params.APP_DC_NAME}")
+                            def rolloutManager = nodedc.rollout()
+                            rolloutManager.latest()
+
+                            timeout(10) {
+                                nodedc.rollout().status("-w")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            mail to: "${params.NOTIFY_EMAIL_LIST}",
+            from: "${params.NOTIFY_EMAIL_FROM}",
+            replyTo: "${params.NOTIFY_EMAIL_REPLYTO}",
+            subject: "${params.IMAGE_STREAM_NAME} version ${env.RELEASE_VERSION} released to production",
+            body: "Visit ${env.BUILD_URL} for details."
+        }
+        failure {
+            mail to: "${params.NOTIFY_EMAIL_LIST}",
+            from: "${params.NOTIFY_EMAIL_FROM}",
+            replyTo: "${params.NOTIFY_EMAIL_REPLYTO}",
+            subject: "Failed production release of ${params.IMAGE_STREAM_NAME} version ${env.RELEASE_VERSION}",
+            body: "Visit ${env.BUILD_URL} for details."
+        }
+    }
+}
+
+// vim: ft=groovy
